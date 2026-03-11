@@ -1,6 +1,6 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
-import openai
+import httpx
 import tempfile
 import os
 
@@ -20,29 +20,36 @@ def root():
 @app.post("/transcribe")
 async def transcribe(
     file: UploadFile = File(...),
-    openai_key: str = None,
+    openai_key: str = Form(...),
 ):
     if not openai_key:
         raise HTTPException(status_code=400, detail="openai_key is required")
 
-    # Save upload to temp file
-    suffix = os.path.splitext(file.filename)[1] or ".mp4"
+    suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         content = await file.read()
         tmp.write(content)
         tmp_path = tmp.name
 
     try:
-        client = openai.OpenAI(api_key=openai_key)
-        with open(tmp_path, "rb") as f:
-            result = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                language="ja",
-                response_format="text"
-            )
-        return {"transcript": result}
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            with open(tmp_path, "rb") as f:
+                res = await client.post(
+                    "https://api.openai.com/v1/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {openai_key}"},
+                    files={"file": (file.filename or "audio.wav", f, "audio/wav")},
+                    data={"model": "whisper-1", "language": "ja", "response_format": "text"},
+                )
+
+        if res.status_code != 200:
+            raise HTTPException(status_code=res.status_code, detail=res.text[:300])
+
+        return {"transcript": res.text.strip()}
+
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Whisper timeout — try a shorter clip")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        os.unlink(tmp_path)
+        try: os.unlink(tmp_path)
+        except: pass
